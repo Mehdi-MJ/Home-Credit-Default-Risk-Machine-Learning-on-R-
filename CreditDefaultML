@@ -1,0 +1,871 @@
+# Load packages
+library(dplyr)
+library(readr)
+library(caret)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(ROCR)
+library(xgboost)
+library(Matrix)
+library(pROC)
+library(gridExtra)
+library(neuralnet)
+library(data.table)
+library(tidyr)  
+
+############## PRE-PROCESSING ####################
+
+
+df <- fread("R Project/AT/application_train.csv")
+
+# Defining variable lists upfront for reusability
+quant_vars <- c("DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_LAST_PHONE_CHANGE",
+                "AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE",
+                "CNT_CHILDREN", "REGION_POPULATION_RELATIVE",
+                "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")
+
+cat_vars <- c("NAME_CONTRACT_TYPE", "CODE_GENDER", "FLAG_OWN_CAR", 
+              "FLAG_OWN_REALTY", "REGION_RATING_CLIENT")
+
+# Selecting variables
+keep_vars <- c("TARGET", quant_vars, cat_vars)
+df_clean <- df[, ..keep_vars]
+
+# Removing anomaly and filtering
+df_clean <- df_clean[DAYS_EMPLOYED != 365243 & 
+                       !is.na(AMT_ANNUITY) & 
+                       !is.na(DAYS_LAST_PHONE_CHANGE) & 
+                       !is.na(AMT_GOODS_PRICE) & 
+                       CODE_GENDER != "XNA"]
+
+# Vectorizing date conversions for faster time
+df_clean[, `:=`(
+  AGE = round(abs(DAYS_BIRTH) / 365, 4),
+  YEARS_EMPLOYED = round(abs(DAYS_EMPLOYED) / 365, 4),
+  MONTHS_LAST_PHONE_CHANGE = round(abs(DAYS_LAST_PHONE_CHANGE) / 30, 4)
+)]
+
+# Removing original date columns
+df_clean[, c("DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_LAST_PHONE_CHANGE") := NULL]
+
+# Converting to factors 
+factor_cols <- c("TARGET", cat_vars)
+df_clean[, (factor_cols) := lapply(.SD, as.factor), .SDcols = factor_cols]
+df_clean[, CODE_GENDER := droplevels(CODE_GENDER)]
+
+# Efficient missing value imputation with flags
+ext_sources <- c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3")
+for (var in ext_sources) {
+  flag_name <- paste0(var, "_NA")
+  median_val <- df_clean[, median(get(var), na.rm = TRUE)]
+  
+  df_clean[, (flag_name) := fifelse(is.na(get(var)), 1L, 0L)]
+  df_clean[is.na(get(var)), (var) := median_val]
+  df_clean[, (flag_name) := as.factor(get(flag_name))]
+}
+
+# Feature engineering
+df_clean[, `:=`(
+  # Financial ratios
+  CREDIT_TO_INCOME = AMT_CREDIT / AMT_INCOME_TOTAL,
+  ANNUITY_TO_INCOME = AMT_ANNUITY / AMT_INCOME_TOTAL,
+  GOODS_PRICE_TO_INCOME = AMT_GOODS_PRICE / AMT_INCOME_TOTAL,
+  ANNUITY_TO_CREDIT = AMT_ANNUITY / AMT_CREDIT,
+  
+  # Age/employment ratios
+  EMPLOYED_TO_AGE = YEARS_EMPLOYED / AGE,
+  
+  # Interaction features
+  CREDIT_TO_INCOME_AGE = (AMT_CREDIT / AMT_INCOME_TOTAL) * AGE,
+  ANNUITY_TO_INCOME_EMPLOYED = (AMT_ANNUITY / AMT_INCOME_TOTAL) * YEARS_EMPLOYED,
+  INCOME_REALTY_OWN = AMT_INCOME_TOTAL * as.integer(FLAG_OWN_REALTY == "Y"),
+  INCOME_CAR_OWN = AMT_INCOME_TOTAL * as.integer(FLAG_OWN_CAR == "Y"),
+  CREDIT_ANNUITY_CAR = AMT_CREDIT * as.integer(FLAG_OWN_CAR == "Y"),
+  
+  # External score interactions
+  EXT1_EXT2 = EXT_SOURCE_1 * EXT_SOURCE_2,
+  EXT1_EXT3 = EXT_SOURCE_1 * EXT_SOURCE_3,
+  EXT2_AGE = EXT_SOURCE_2 * AGE,
+  EXT1_CREDITTOINCOME = EXT_SOURCE_1 * (AMT_CREDIT / AMT_INCOME_TOTAL),
+  
+  # Stability
+  EMPLOYED_PHONECHANGE = YEARS_EMPLOYED * MONTHS_LAST_PHONE_CHANGE,
+  AGE_EMPLOYED = AGE * YEARS_EMPLOYED
+)]
+
+# Converting back to data.frame
+df_clean <- as.data.frame(df_clean)
+
+############## OPTIMIZED BALANCING ####################
+
+# Balancing function
+create_balanced_dataset <- function(df, seed = 123) {
+  set.seed(seed)
+  
+  # Splitting by class
+  df_list <- split(df, df$TARGET)
+  df_1 <- df_list[["1"]]
+  df_0 <- df_list[["0"]]
+  
+  # Undersampling majority class
+  n_minority <- nrow(df_1)
+  df_0_sampled <- df_0[sample(nrow(df_0), n_minority), ]
+  
+  # Combining and shuffling
+  df_balanced <- rbind(df_1, df_0_sampled)
+  df_balanced[sample(nrow(df_balanced)), ]
+}
+
+df_balanced <- create_balanced_dataset(df_clean)
+
+############## VISUALIZATIONS ####################
+
+# Class distribution plot to check imbalance
+p1 <- ggplot(df_clean, aes(TARGET)) +
+  geom_bar(fill = "steelblue") +
+  geom_text(stat = 'count', aes(label = after_stat(count)), vjust = -0.3) +
+  labs(
+    title = "Unbalanced Dataset – Class Distribution",
+    x = "TARGET", y = "Count"
+  ) +
+  theme_minimal()
+
+p2 <- ggplot(df_balanced, aes(TARGET)) +
+  geom_bar(fill = "tomato") +
+  geom_text(stat = 'count', aes(label = after_stat(count)), vjust = -0.3) +
+  labs(
+    title = "Balanced Dataset (Undersampling) – Class Distribution",
+    x = "TARGET", y = "Count"
+  ) +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+
+############## DATA PREPARATION ####################
+
+# Unified preprocessing function
+prepare_model_data <- function(df, scaler = NULL, dummy_model = NULL) {
+  cat_vars <- names(df)[sapply(df, is.factor) & names(df) != "TARGET"]
+  num_vars <- names(df)[sapply(df, is.numeric)]
+  
+  # One-hot encoding
+  if (is.null(dummy_model)) {
+    dummy_model <- dummyVars(~ ., data = df[, cat_vars], fullRank = TRUE)
+  }
+  ohe <- as.data.frame(predict(dummy_model, newdata = df[, cat_vars]))
+  
+  # Scaling
+  if (is.null(scaler)) {
+    scaler <- preProcess(df[, num_vars], method = c("center", "scale"))
+  }
+  num_scaled <- as.data.frame(predict(scaler, df[, num_vars]))
+  
+  # Combining
+  result <- cbind(num_scaled, ohe, TARGET = df$TARGET)
+  
+  return(list(data = result, scaler = scaler, dummy_model = dummy_model))
+}
+
+# Creating all datasets with train/test splits
+set.seed(123)
+
+# Unbalanced datasets
+trainIndex_clean <- createDataPartition(df_clean$TARGET, p = 0.8, list = FALSE)
+train_tree <- df_clean[trainIndex_clean, ]
+test_tree <- df_clean[-trainIndex_clean, ]
+
+prep_unbal <- prepare_model_data(train_tree)
+train_db <- prep_unbal$data
+test_db <- prepare_model_data(test_tree, prep_unbal$scaler, prep_unbal$dummy_model)$data
+
+# Balanced datasets
+trainIndex_bal <- createDataPartition(df_balanced$TARGET, p = 0.8, list = FALSE)
+train_balanced_tree <- df_balanced[trainIndex_bal, ]
+test_balanced_tree <- df_balanced[-trainIndex_bal, ]
+
+prep_bal <- prepare_model_data(train_balanced_tree)
+train_balanced_db <- prep_bal$data
+test_balanced_db <- prepare_model_data(test_balanced_tree, prep_bal$scaler, prep_bal$dummy_model)$data
+
+############## MODELING ####################
+
+# Unified evaluation function
+evaluate_predictions <- function(pred_class, pred_prob, actual, positive = "1") {
+  cm <- confusionMatrix(as.factor(pred_class), as.factor(actual), positive = positive)
+  auc_val <- tryCatch(as.numeric(roc(actual, pred_prob, quiet = TRUE)$auc), 
+                      error = function(e) NA)
+  
+  data.frame(
+    Accuracy = cm$overall['Accuracy'],
+    Kappa = cm$overall['Kappa'],
+    Sensitivity = cm$byClass['Sensitivity'],
+    Specificity = cm$byClass['Specificity'],
+    Pos_Pred_Value = cm$byClass['Pos Pred Value'],
+    Neg_Pred_Value = cm$byClass['Neg Pred Value'],
+    Balanced_Accuracy = cm$byClass['Balanced Accuracy'],
+    AUC = auc_val
+  )
+}
+
+############### DECISION TREE #################
+
+run_tree_optimized <- function(train_df, test_df, param_grid) {
+  results <- lapply(1:nrow(param_grid), function(i) {
+    params <- param_grid[i, ]
+    
+    tree_model <- rpart(
+      TARGET ~ .,
+      data = train_df,
+      method = "class",
+      parms = list(prior = c(params$prior_0, params$prior_1)),
+      control = rpart.control(cp = params$cp, minsplit = params$minsplit)
+    )
+    
+    tree_preds <- predict(tree_model, test_df, type = "class")
+    tree_probs <- predict(tree_model, test_df, type = "prob")[, "1"]
+    
+    metrics <- evaluate_predictions(tree_preds, tree_probs, test_df$TARGET)
+    cbind(iteration = i, params, metrics)
+  })
+  
+  do.call(rbind, results)
+}
+
+# Defining the parameter grid
+tree_params <- data.frame(
+  cp = c(0.0005, 0.0008, 0.001, 0.001, 0.002, 0.002, 0.0008, 0.001),
+  minsplit = c(1500, 2000, 2000, 2500, 1500, 2000, 2500, 2000),
+  prior_0 = c(0.5, 0.5, 0.52, 0.48, 0.5, 0.52, 0.5, 0.52),
+  prior_1 = c(0.5, 0.5, 0.48, 0.52, 0.5, 0.48, 0.5, 0.48)
+)
+
+results_tree_unbal <- run_tree_optimized(train_tree, test_tree, tree_params)
+results_tree_bal <- run_tree_optimized(train_balanced_tree, test_balanced_tree, tree_params)
+
+# Saving the results
+write.csv(results_tree_unbal, "tree_results_unbalanced.csv", row.names = FALSE)
+write.csv(results_tree_bal, "tree_results_balanced.csv", row.names = FALSE)
+
+# Plotting best tree
+all_tree_results <- rbind(
+  cbind(results_tree_unbal, dataset = "unbalanced"),
+  cbind(results_tree_bal, dataset = "balanced")
+)
+
+all_tree_results$Kappa_std <- (all_tree_results$Kappa - min(all_tree_results$Kappa)) / 
+  (max(all_tree_results$Kappa) - min(all_tree_results$Kappa))
+all_tree_results$Balanced_std <- (all_tree_results$Balanced_Accuracy - 
+                                    min(all_tree_results$Balanced_Accuracy)) / 
+  (max(all_tree_results$Balanced_Accuracy) - min(all_tree_results$Balanced_Accuracy))
+all_tree_results$score <- all_tree_results$Kappa_std + all_tree_results$Balanced_std
+
+best_tree_row <- all_tree_results[which.max(all_tree_results$score), ]
+train_df_tree <- if(best_tree_row$dataset == "unbalanced") train_tree else train_balanced_tree
+
+best_tree <- rpart(
+  TARGET ~ .,
+  data = train_df_tree,
+  method = "class",
+  parms = list(prior = c(best_tree_row$prior_0, best_tree_row$prior_1)),
+  control = rpart.control(cp = best_tree_row$cp, minsplit = best_tree_row$minsplit)
+)
+
+rpart.plot(
+  best_tree,
+  type = 3,
+  extra = 104,
+  fallen.leaves = TRUE,
+  under = TRUE,
+  cex = 0.8,
+  split.border.col = NA,
+  split.box.col = NA,
+  main = "Best Decision Tree (Combined Kappa & Balanced Accuracy)"
+)
+
+# Variable importance plot
+if(!is.null(best_tree$variable.importance)) {
+  var_imp <- sort(best_tree$variable.importance, decreasing = TRUE)
+  barplot(
+    var_imp,
+    main = "Variable Importance (Best Tree)",
+    col = "steelblue",
+    las = 2,
+    cex.names = 0.7
+  )
+}
+
+############### XGBOOST #################
+
+run_xgb_optimized <- function(train_df, test_df, features, param_grid, balanced = FALSE) {
+  train_x <- data.matrix(train_df[, features])
+  test_x <- data.matrix(test_df[, features])
+  train_y <- as.numeric(as.character(train_df$TARGET))
+  test_y <- as.numeric(as.character(test_df$TARGET))
+  
+  dtrain <- xgb.DMatrix(data = train_x, label = train_y)
+  dtest <- xgb.DMatrix(data = test_x, label = test_y)
+  
+  scale_pos_weight <- if (!balanced) sum(train_y == 0) / sum(train_y == 1) else 1
+  
+  results <- lapply(seq_along(param_grid), function(i) {
+    p <- param_grid[[i]]
+    
+    params <- list(
+      booster = "gbtree",
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      eta = p$eta,
+      max_depth = p$max_depth,
+      min_child_weight = p$min_child_weight,
+      subsample = p$subsample,
+      colsample_bytree = p$colsample_bytree,
+      scale_pos_weight = scale_pos_weight
+    )
+    
+    set.seed(123)
+    model <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = p$nrounds,
+      early_stopping_rounds = 100,
+      watchlist = list(test = dtest),
+      verbose = 0
+    )
+    
+    pred_prob <- predict(model, dtest)
+    pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+    
+    metrics <- evaluate_predictions(pred_class, pred_prob, test_y)
+    cbind(Model = i, as.data.frame(p), metrics, 
+          nrounds_used = model$best_iteration %||% p$nrounds)
+  })
+  
+  do.call(rbind, results)
+}
+
+# XGBoost parameters reduced for speed, but tweaking them especially learning rounds and speed will improve model
+# We reached .5 kappa with eta .01 and 1500/ nrounds
+xgb_params <- list(
+  list(eta = 0.05, max_depth = 4, min_child_weight = 250, 
+       subsample = 0.8, colsample_bytree = 0.8, nrounds = 1000),
+  list(eta = 0.03, max_depth = 4, min_child_weight = 200, 
+       subsample = 0.85, colsample_bytree = 0.85, nrounds = 1000)
+)
+
+# Defining features
+xgb_features <- setdiff(names(train_tree), "TARGET")
+
+results_xgb_unbal <- run_xgb_optimized(train_tree, test_tree, xgb_features, 
+                                       xgb_params, balanced = FALSE)
+results_xgb_bal <- run_xgb_optimized(train_balanced_tree, test_balanced_tree, 
+                                     xgb_features, xgb_params, balanced = TRUE)
+
+# Saving results
+write.csv(results_xgb_unbal, "xgb_results_unbalanced.csv", row.names = FALSE)
+write.csv(results_xgb_bal, "xgb_results_balanced.csv", row.names = FALSE)
+
+# Variable importance plot for best XGBoost model
+all_xgb_results <- rbind(
+  cbind(results_xgb_unbal, dataset = "unbalanced"),
+  cbind(results_xgb_bal, dataset = "balanced")
+)
+
+all_xgb_results$Kappa_std <- (all_xgb_results$Kappa - min(all_xgb_results$Kappa)) / 
+  (max(all_xgb_results$Kappa) - min(all_xgb_results$Kappa))
+all_xgb_results$Balanced_std <- (all_xgb_results$Balanced_Accuracy - 
+                                   min(all_xgb_results$Balanced_Accuracy)) / 
+  (max(all_xgb_results$Balanced_Accuracy) - min(all_xgb_results$Balanced_Accuracy))
+all_xgb_results$score <- all_xgb_results$Kappa_std + all_xgb_results$Balanced_std
+
+best_xgb_row <- all_xgb_results[which.max(all_xgb_results$score), ]
+train_df_xgb <- if(best_xgb_row$dataset == "unbalanced") train_tree else train_balanced_tree
+
+# Rebuild best XGBoost model
+train_x <- data.matrix(train_df_xgb[, xgb_features])
+train_y <- as.numeric(as.character(train_df_xgb$TARGET))
+dtrain <- xgb.DMatrix(data = train_x, label = train_y)
+
+scale_pos_weight <- if(best_xgb_row$dataset == "unbalanced") {
+  sum(train_y == 0) / sum(train_y == 1)
+} else 1
+
+best_xgb_params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  eta = best_xgb_row$eta,
+  max_depth = best_xgb_row$max_depth,
+  min_child_weight = best_xgb_row$min_child_weight,
+  subsample = best_xgb_row$subsample,
+  colsample_bytree = best_xgb_row$colsample_bytree,
+  scale_pos_weight = scale_pos_weight
+)
+
+set.seed(123)
+best_xgb_model <- xgb.train(
+  params = best_xgb_params,
+  data = dtrain,
+  nrounds = best_xgb_row$nrounds_used,
+  verbose = 0
+)
+
+# Plotting variable importance
+importance_matrix <- xgb.importance(model = best_xgb_model)
+xgb.plot.importance(importance_matrix, top_n = 20, measure = "Gain")
+
+############### GLM #################
+
+run_glm_optimized <- function(train_df, test_df, var_sets, balanced = TRUE) {
+  weights <- if (!balanced) {
+    y <- as.numeric(as.character(train_df$TARGET))
+    ifelse(y == 1, sum(y == 0) / sum(y == 1), 1)
+  } else {
+    rep(1, nrow(train_df))
+  }
+  
+  results <- lapply(seq_along(var_sets), function(i) {
+    vars <- var_sets[[i]]
+    formula <- as.formula(paste("TARGET ~", paste(vars, collapse = "+")))
+    
+    model <- glm(formula, data = train_df, family = binomial(), weights = weights)
+    
+    pred_prob <- predict(model, test_df, type = "response")
+    pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+    
+    metrics <- evaluate_predictions(pred_class, pred_prob, test_df$TARGET)
+    cbind(iteration = i, n_vars = length(vars), metrics)
+  })
+  
+  do.call(rbind, results)
+}
+
+# GLM variable sets (simplified)
+glm_var_sets <- list(
+  c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "AGE", "YEARS_EMPLOYED"),
+  c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "AGE", "YEARS_EMPLOYED", 
+    "CREDIT_TO_INCOME", "ANNUITY_TO_INCOME")
+)
+
+results_glm_unbal <- run_glm_optimized(train_tree, test_tree, glm_var_sets, balanced = FALSE)
+results_glm_bal <- run_glm_optimized(train_balanced_tree, test_balanced_tree, 
+                                     glm_var_sets, balanced = TRUE)
+
+# Saving results
+write.csv(results_glm_unbal, "glm_results_unbalanced.csv", row.names = FALSE)
+write.csv(results_glm_bal, "glm_results_balanced.csv", row.names = FALSE)
+
+############### kNN #################
+
+run_knn_optimized <- function(train_df, test_df, var_sets, balanced = TRUE) {
+  results <- lapply(seq_along(var_sets), function(i) {
+    vars <- var_sets[[i]]$vars
+    k_val <- var_sets[[i]]$k
+    w_pos <- var_sets[[i]]$weight_pos
+    
+    # Handling unbalanced weighting by duplicating rows
+    if (!balanced && w_pos > 1) {
+      pos_rows <- train_df[train_df$TARGET == 1, ]
+      neg_rows <- train_df[train_df$TARGET == 0, ]
+      pos_dup <- pos_rows[rep(1:nrow(pos_rows), w_pos), ]
+      train_weighted <- rbind(neg_rows, pos_dup)
+    } else {
+      train_weighted <- train_df
+    }
+    
+    # Extracting features
+    train_x <- as.matrix(train_weighted[, vars])
+    train_y <- train_weighted$TARGET
+    test_x <- as.matrix(test_df[, vars])
+    test_y <- test_df$TARGET
+    
+    # kNN prediction
+    knn_pred <- class::knn(
+      train = train_x,
+      test = test_x,
+      cl = train_y,
+      k = k_val
+    )
+    
+    # Converting to numeric for AUC calculations
+    knn_prob <- as.numeric(knn_pred) - 1
+    
+    metrics <- evaluate_predictions(knn_pred, knn_prob, test_y)
+    cbind(iteration = i, k = k_val, weight_pos = w_pos, 
+          n_vars = length(vars), metrics)
+  })
+  
+  do.call(rbind, results)
+}
+
+# kNN parameter sets (optimized but barely any improvement with tweaking)
+knn_var_sets <- list(
+  list(vars = c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "AGE", "YEARS_EMPLOYED"), 
+       k = 5, weight_pos = 2),
+  list(vars = c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "AGE", "YEARS_EMPLOYED", 
+                "CREDIT_TO_INCOME"), k = 7, weight_pos = 2),
+  list(vars = c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "AGE", "YEARS_EMPLOYED", 
+                "CREDIT_TO_INCOME", "ANNUITY_TO_INCOME"), k = 9, weight_pos = 3),
+  list(vars = c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "CREDIT_TO_INCOME", 
+                "ANNUITY_TO_INCOME", "GOODS_PRICE_TO_INCOME", "EMPLOYED_TO_AGE", 
+                "INCOME_CAR_OWN"), k = 11, weight_pos = 3)
+)
+
+results_knn_unbal <- run_knn_optimized(train_db, test_db, knn_var_sets, balanced = FALSE)
+results_knn_bal <- run_knn_optimized(train_balanced_db, test_balanced_db, knn_var_sets, 
+                                     balanced = TRUE)
+
+# Saving results
+write.csv(results_knn_unbal, "kNN_results_unbalanced.csv", row.names = FALSE)
+write.csv(results_knn_bal, "kNN_results_balanced.csv", row.names = FALSE)
+
+############### NEURAL NETWORK #################
+
+# Create smaller balanced dataset for NN (to improve speed)
+set.seed(123)
+subset_balanced <- function(df, n_total = 6000) {
+  n_per_class <- floor(n_total / 2)
+  
+  df_0 <- df[df$TARGET == 0, ]
+  df_1 <- df[df$TARGET == 1, ]
+  
+  df_0_s <- df_0[sample(nrow(df_0), min(n_per_class, nrow(df_0))), ]
+  df_1_s <- df_1[sample(nrow(df_1), min(n_per_class, nrow(df_1))), ]
+  
+  df_s <- rbind(df_0_s, df_1_s)
+  df_s[sample(nrow(df_s)), ]
+}
+
+# Prepare small dataset
+full_small <- subset_balanced(df_balanced, n_total = 6000)
+train_idx <- sample(nrow(full_small), 4000)
+train_small <- full_small[train_idx, ]
+test_small <- full_small[-train_idx, ]
+
+# Prepare scaled data for NN
+prep_small <- prepare_model_data(train_small)
+train_final <- prep_small$data
+test_final <- prepare_model_data(test_small, prep_small$scaler, prep_small$dummy_model)$data
+
+# Optimized NN function with parallel cross-validation
+run_nn_optimized <- function(train_df, test_df, var_sets, architectures, k_folds = 3) {
+  
+  # Preparing all data 
+  all_vars <- unique(unlist(lapply(var_sets, function(x) x$vars)))
+  
+  train_X_all <- as.data.frame(lapply(train_df[, all_vars], function(x) as.numeric(as.character(x))))
+  train_y <- as.numeric(as.character(train_df$TARGET))
+  
+  test_X_all <- as.data.frame(lapply(test_df[, all_vars], function(x) as.numeric(as.character(x))))
+  test_y <- as.numeric(as.character(test_df$TARGET))
+  
+  # Creating folds
+  set.seed(123)
+  fold_indices <- createFolds(train_y, k = k_folds, list = TRUE, returnTrain = FALSE)
+  
+  results <- list()
+  model_id <- 1
+  
+  for (var_idx in seq_along(var_sets)) {
+    vars <- var_sets[[var_idx]]$vars
+    X_full <- train_X_all[, vars, drop = FALSE]
+    X_test <- test_X_all[, vars, drop = FALSE]
+    
+    for (arch_idx in seq_along(architectures)) {
+      arch <- architectures[[arch_idx]]$units
+      arch_str <- paste(arch, collapse = "-")
+      
+      cat(sprintf("Training NN %d: %d vars, arch %s\n", model_id, length(vars), arch_str))
+      
+      fold_results <- list()
+      
+      for (fold in seq_along(fold_indices)) {
+        if (k_folds >= 2) {
+          val_idx <- fold_indices[[fold]]
+          train_idx <- setdiff(seq_len(nrow(X_full)), val_idx)
+          X_train <- X_full[train_idx, , drop = FALSE]
+          y_train <- train_y[train_idx]
+          X_val <- X_full[val_idx, , drop = FALSE]
+          y_val <- train_y[val_idx]
+        } else {
+          X_train <- X_full
+          y_train <- train_y
+          X_val <- X_test
+          y_val <- test_y
+        }
+        
+        train_data <- X_train
+        train_data$TARGET <- y_train
+        
+        formula_str <- paste("TARGET ~", paste(vars, collapse = " + "))
+        nn_formula <- as.formula(formula_str)
+        
+        # Training with error handling
+        nn_model <- tryCatch({
+          neuralnet(
+            formula = nn_formula,
+            data = train_data,
+            hidden = arch,
+            linear.output = FALSE,
+            threshold = 0.5,
+            stepmax = 5e4,  # Reduced from 7e4
+            rep = 1,
+            learningrate = 0.03,
+            algorithm = "rprop+",
+            err.fct = "ce",
+            act.fct = "logistic",
+            likelihood = FALSE
+          )
+        }, error = function(e) NULL)
+        
+        if (is.null(nn_model)) next
+        
+        # Predict
+        pred_prob <- compute(nn_model, X_val)$net.result[, 1]
+        pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+        
+        metrics <- evaluate_predictions(pred_class, pred_prob, y_val)
+        fold_results[[fold]] <- metrics
+      }
+      
+      if (length(fold_results) > 0) {
+        fold_df <- do.call(rbind, fold_results)
+        avg_metrics <- colMeans(fold_df, na.rm = TRUE)
+        
+        results[[model_id]] <- data.frame(
+          Model_ID = model_id,
+          Var_Set = var_idx,
+          N_Vars = length(vars),
+          Architecture = arch_str,
+          N_Folds = nrow(fold_df),
+          t(avg_metrics)
+        )
+        
+        model_id <- model_id + 1
+      }
+    }
+  }
+  
+  do.call(rbind, results)
+}
+
+# NN parameter sets (Again, not much improvement with tweaking)
+nn_var_sets <- list(
+  list(vars = c("EXT1_EXT3", "EXT1_EXT2", "ANNUITY_TO_CREDIT", "EXT_SOURCE_2", 
+                "EXT_SOURCE_3", "AGE", "AMT_GOODS_PRICE", "EXT2_AGE", "AMT_ANNUITY")),
+  list(vars = c("EMPLOYED_TO_AGE", "EXT_SOURCE_2", "EXT_SOURCE_3", "ANNUITY_TO_INCOME", 
+                "ANNUITY_TO_CREDIT", "CODE_GENDER.M")),
+  list(vars = c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "CREDIT_TO_INCOME", 
+                "ANNUITY_TO_INCOME", "GOODS_PRICE_TO_INCOME", "EMPLOYED_TO_AGE", 
+                "INCOME_CAR_OWN"))
+)
+
+nn_architectures <- list(
+  list(units = c(4, 2)),
+  list(units = c(8, 4))
+)
+
+cat("\n=== Training Neural Networks (this may take a while) ===\n")
+results_nn_bal <- run_nn_optimized(train_final, test_final, nn_var_sets, 
+                                   nn_architectures, k_folds = 3)
+
+# Saving results
+write.csv(results_nn_bal, "DL_balanced_results.csv", row.names = FALSE)
+
+# View and sort NN results
+print(results_nn_bal)
+results_nn_sorted <- results_nn_bal[order(-results_nn_bal$Balanced_Accuracy), ]
+print(head(results_nn_sorted, 10))
+
+
+############## RESULTS COMPARISON ####################
+
+# Function to find best model across all types
+compare_all_models <- function() {
+  all_results <- list(
+    tree_unbal = results_tree_unbal,
+    tree_bal = results_tree_bal,
+    xgb_unbal = results_xgb_unbal,
+    xgb_bal = results_xgb_bal,
+    glm_unbal = results_glm_unbal,
+    glm_bal = results_glm_bal,
+    knn_unbal = results_knn_unbal,
+    knn_bal = results_knn_bal,
+    nn_bal = results_nn_bal
+  )
+  
+  # Defining common columns that all models should have
+  common_cols <- c("Accuracy", "Kappa", "Sensitivity", "Specificity", 
+                   "Pos_Pred_Value", "Neg_Pred_Value", "Balanced_Accuracy", "AUC")
+  
+  # Adding model type and dataset info, select only common columns
+  all_results <- lapply(names(all_results), function(name) {
+    df <- all_results[[name]]
+    parts <- strsplit(name, "_")[[1]]
+    
+    # Selecting only common columns that exist
+    existing_common <- common_cols[common_cols %in% names(df)]
+    df_subset <- df[, existing_common, drop = FALSE]
+    
+    # Add metadata
+    df_subset$model_type <- parts[1]
+    df_subset$dataset <- parts[2]
+    df_subset$iteration <- 1:nrow(df_subset)
+    
+    df_subset
+  })
+  
+  combined <- do.call(rbind, all_results)
+  rownames(combined) <- NULL
+  
+  # Standardized scoring
+  combined$Kappa_std <- (combined$Kappa - min(combined$Kappa, na.rm = TRUE)) / 
+    (max(combined$Kappa, na.rm = TRUE) - min(combined$Kappa, na.rm = TRUE))
+  combined$BalAcc_std <- (combined$Balanced_Accuracy - 
+                            min(combined$Balanced_Accuracy, na.rm = TRUE)) / 
+    (max(combined$Balanced_Accuracy, na.rm = TRUE) - 
+       min(combined$Balanced_Accuracy, na.rm = TRUE))
+  combined$score <- combined$Kappa_std + combined$BalAcc_std
+  
+  combined[order(-combined$score), ]
+}
+
+final_comparison <- compare_all_models()
+print(head(final_comparison, 10))
+
+# Saving results
+write.csv(final_comparison, "all_models_comparison.csv", row.names = FALSE)
+
+cat("\n=== OPTIMIZATION COMPLETE ===\n")
+cat("Best Model:", final_comparison[1, "model_type"], 
+    "(", final_comparison[1, "dataset"], ")\n")
+cat("Balanced Accuracy:", round(final_comparison[1, "Balanced_Accuracy"], 4), "\n")
+cat("Kappa:", round(final_comparison[1, "Kappa"], 4), "\n")
+cat("AUC:", round(final_comparison[1, "AUC"], 4), "\n")
+
+############## FINAL COMPARISON PLOTS ####################
+
+# Preparing data for comparison plots
+comparison_summary <- final_comparison %>%
+  group_by(model_type, dataset) %>%
+  summarise(
+    Mean_Kappa = mean(Kappa, na.rm = TRUE),
+    Mean_BalAcc = mean(Balanced_Accuracy, na.rm = TRUE),
+    Mean_AUC = mean(AUC, na.rm = TRUE),
+    SD_Kappa = sd(Kappa, na.rm = TRUE),
+    SD_BalAcc = sd(Balanced_Accuracy, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+comparison_summary$model_dataset <- paste(comparison_summary$model_type, 
+                                          comparison_summary$dataset, sep = "_")
+
+# Plot 1: Kappa comparison across all models
+p_kappa_comparison <- ggplot(comparison_summary, aes(x = reorder(model_dataset, Mean_Kappa), 
+                                                     y = Mean_Kappa, fill = model_type)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymin = Mean_Kappa - SD_Kappa, ymax = Mean_Kappa + SD_Kappa), 
+                width = 0.2, alpha = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Model Comparison: Kappa Score",
+    subtitle = "Error bars show ±1 SD",
+    x = "Model",
+    y = "Kappa",
+    fill = "Model Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_kappa_comparison)
+
+# Plot 2: Balanced Accuracy comparison across all models
+p_balacc_comparison <- ggplot(comparison_summary, aes(x = reorder(model_dataset, Mean_BalAcc), 
+                                                      y = Mean_BalAcc, fill = model_type)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymin = Mean_BalAcc - SD_BalAcc, ymax = Mean_BalAcc + SD_BalAcc), 
+                width = 0.2, alpha = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Model Comparison: Balanced Accuracy",
+    subtitle = "Error bars show ±1 SD",
+    x = "Model",
+    y = "Balanced Accuracy",
+    fill = "Model Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_balacc_comparison)
+
+# Plot 3: Kappa vs Balanced Accuracy scatter plot for all models
+p_kappa_vs_balacc <- ggplot(comparison_summary, aes(x = Mean_Kappa, y = Mean_BalAcc, 
+                                                    color = model_type, shape = dataset, 
+                                                    size = Mean_AUC)) +
+  geom_point(alpha = 0.7) +
+  geom_text(aes(label = model_type), vjust = -1, size = 3, show.legend = FALSE) +
+  labs(
+    title = "All Models: Kappa vs Balanced Accuracy",
+    subtitle = "Size represents AUC",
+    x = "Mean Kappa",
+    y = "Mean Balanced Accuracy",
+    color = "Model Type",
+    shape = "Dataset",
+    size = "Mean AUC"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(p_kappa_vs_balacc)
+
+# Plot 4: Side-by-side comparison of balanced vs unbalanced
+comparison_long <- comparison_summary %>%
+  select(model_type, dataset, Mean_Kappa, Mean_BalAcc) %>%
+  pivot_longer(cols = c(Mean_Kappa, Mean_BalAcc), 
+               names_to = "Metric", 
+               values_to = "Value") %>%
+  mutate(Metric = gsub("Mean_", "", Metric))
+
+p_balanced_comparison <- ggplot(comparison_long, aes(x = model_type, y = Value, 
+                                                     fill = dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "Balanced vs Unbalanced Dataset Performance",
+    x = "Model Type",
+    y = "Score",
+    fill = "Dataset"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+print(p_balanced_comparison)
+
+# Plot 5: Heatmap of model performance
+comparison_wide <- comparison_summary %>%
+  select(model_type, dataset, Mean_Kappa, Mean_BalAcc, Mean_AUC) %>%
+  pivot_longer(cols = c(Mean_Kappa, Mean_BalAcc, Mean_AUC), 
+               names_to = "Metric", 
+               values_to = "Value") %>%
+  mutate(Metric = gsub("Mean_", "", Metric))
+
+p_heatmap <- ggplot(comparison_wide, aes(x = Metric, y = paste(model_type, dataset, sep = "_"), 
+                                         fill = Value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Value, 3)), color = "white", size = 3) +
+  scale_fill_gradient2(low = "red", mid = "yellow", high = "green", 
+                       midpoint = 0.5, limits = c(0, 1)) +
+  labs(
+    title = "Model Performance Heatmap",
+    x = "Metric",
+    y = "Model",
+    fill = "Score"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+        axis.text.y = element_text(size = 9))
+
+print(p_heatmap)
+
+cat("\n=== ALL VISUALIZATIONS COMPLETE ===\n")
